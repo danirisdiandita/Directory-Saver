@@ -1,3 +1,4 @@
+mod paste;
 mod store;
 mod text_input;
 
