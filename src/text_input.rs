@@ -373,9 +373,10 @@ impl EntityInputHandler for TextInput {
     ) -> Option<Bounds<Pixels>> {
         let last_layout = self.last_layout.as_ref()?;
         let range = self.range_from_utf16(&range_utf16);
+        let left = self.last_bounds.map_or(bounds.left(), |b| b.left());
         Some(Bounds::from_corners(
-            point(bounds.left() + last_layout.x_for_index(range.start), bounds.top()),
-            point(bounds.left() + last_layout.x_for_index(range.end), bounds.bottom()),
+            point(left + last_layout.x_for_index(range.start), bounds.top()),
+            point(left + last_layout.x_for_index(range.end), bounds.bottom()),
         ))
     }
 
@@ -403,6 +404,7 @@ struct PrepaintState {
     line: Option<ShapedLine>,
     cursor: Option<PaintQuad>,
     selection: Option<PaintQuad>,
+    text_bounds: Bounds<Pixels>,
 }
 
 impl IntoElement for TextElement {
@@ -499,6 +501,10 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
+        // Shift the line left just enough to keep the cursor visible in a narrow field.
+        let scroll = (line.x_for_index(cursor) + px(2.) - bounds.size.width).max(px(0.));
+        let bounds = Bounds::new(point(bounds.left() - scroll, bounds.top()), bounds.size);
+
         let (selection, cursor) = if selected_range.is_empty() {
             let x = bounds.left() + line.x_for_index(cursor);
             let cursor = fill(
@@ -523,6 +529,7 @@ impl Element for TextElement {
             line: Some(line),
             cursor,
             selection,
+            text_bounds: bounds,
         }
     }
 
@@ -548,7 +555,8 @@ impl Element for TextElement {
         let Some(line) = prepaint.line.take() else {
             return;
         };
-        line.paint(bounds.origin, window.line_height(), window, cx)
+        let text_bounds = prepaint.text_bounds;
+        line.paint(text_bounds.origin, window.line_height(), window, cx)
             .ok();
 
         if focus_handle.is_focused(window)
@@ -559,7 +567,7 @@ impl Element for TextElement {
 
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
-            input.last_bounds = Some(bounds);
+            input.last_bounds = Some(text_bounds);
         });
     }
 }
