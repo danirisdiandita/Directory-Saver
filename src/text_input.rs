@@ -90,11 +90,6 @@ impl TextInput {
         cx.notify();
     }
 
-    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
-        self.placeholder = placeholder.into();
-        cx.notify();
-    }
-
     fn left(&mut self, _: &Left, _: &mut Window, cx: &mut Context<Self>) {
         if self.selected_range.is_empty() {
             self.move_to(self.previous_boundary(self.cursor_offset()), cx);

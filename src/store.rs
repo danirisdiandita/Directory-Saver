@@ -14,6 +14,11 @@ pub struct Directory {
     pub open_count: i64,
 }
 
+pub struct Added {
+    pub dir: Directory,
+    pub is_new: bool,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -55,7 +60,7 @@ impl Store {
         Ok(Store { conn })
     }
 
-    pub fn add(&self, path: &Path) -> Result<Directory> {
+    pub fn add(&self, path: &Path) -> Result<Added> {
         let path = path
             .canonicalize()
             .with_context(|| format!("{} is not accessible", path.display()))?;
@@ -67,16 +72,17 @@ impl Store {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| path_str.to_owned());
-        self.conn.execute(
+        let inserted = self.conn.execute(
             "INSERT INTO directories (path, name, added_at) VALUES (?1, ?2, ?3)
              ON CONFLICT(path) DO NOTHING",
             params![path_str, name, now()],
         )?;
-        Ok(self.conn.query_row(
+        let dir = self.conn.query_row(
             &format!("SELECT {COLUMNS} FROM directories WHERE path = ?1"),
             [path_str],
             directory_from_row,
-        )?)
+        )?;
+        Ok(Added { dir, is_new: inserted > 0 })
     }
 
     pub fn search(&self, query: &str) -> Result<Vec<Directory>> {
@@ -176,6 +182,9 @@ mod tests {
         let first = store.add(&p).unwrap();
         let again = store.add(&p.join("..").join("proj")).unwrap();
 
+        assert!(first.is_new);
+        assert!(!again.is_new);
+        let (first, again) = (first.dir, again.dir);
         assert_eq!(first, again);
         assert_eq!(store.search("").unwrap().len(), 1);
         assert_eq!(first.name, "proj");
@@ -222,7 +231,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let root = TempDir::new().unwrap();
         let ps = dirs(&root, &["alpha", "beta", "gamma"]);
-        let added: Vec<_> = ps.iter().map(|p| store.add(p).unwrap()).collect();
+        let added: Vec<_> = ps.iter().map(|p| store.add(p).unwrap().dir).collect();
 
         assert_eq!(names(&store.search("").unwrap()), ["gamma", "beta", "alpha"]);
 
@@ -240,8 +249,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let root = TempDir::new().unwrap();
         let ps = dirs(&root, &["keep", "drop"]);
-        let keep = store.add(&ps[0]).unwrap();
-        let drop = store.add(&ps[1]).unwrap();
+        let keep = store.add(&ps[0]).unwrap().dir;
+        let drop = store.add(&ps[1]).unwrap().dir;
 
         store.remove(drop.id).unwrap();
 
