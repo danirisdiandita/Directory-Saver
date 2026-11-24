@@ -30,7 +30,7 @@ const ROW_HEIGHT: f32 = 44.;
 
 actions!(
     directory_saver,
-    [SelectPrev, SelectNext, OpenSelected, ClearQuery, AddDirectory, RemoveSelected, Quit]
+    [SelectPrev, SelectNext, Confirm, Cancel, OpenFolder, PastePath, RemoveSelected, Quit]
 );
 
 const CONTEXT: &str = "DirectorySaver";
@@ -38,6 +38,28 @@ const CONTEXT: &str = "DirectorySaver";
 enum Notice {
     Error(SharedString),
     Info(SharedString),
+}
+
+/// What the one text input is for right now.
+#[derive(Clone, Copy, PartialEq)]
+enum InputMode {
+    Search,
+    AddPath,
+}
+
+impl InputMode {
+    fn placeholder(self) -> &'static str {
+        match self {
+            InputMode::Search => "Search directories…",
+            InputMode::AddPath => "Paste a directory path…",
+        }
+    }
+}
+
+enum PathCheck {
+    Empty,
+    Ready(PathBuf),
+    Invalid(&'static str),
 }
 
 /// Which row should be selected once results are reloaded.
@@ -50,6 +72,7 @@ enum Keep {
 struct DirectorySaver {
     store: Store,
     input: Entity<TextInput>,
+    mode: InputMode,
     results: Vec<Directory>,
     selected: Option<usize>,
     notice: Option<Notice>,
@@ -62,7 +85,7 @@ impl DirectorySaver {
     fn new(store: Store, cx: &mut Context<Self>) -> Self {
         let input = cx.new(|cx| {
             TextInput::new(
-                "Search directories…",
+                InputMode::Search.placeholder(),
                 InputColors {
                     text: rgb(TEXT).into(),
                     placeholder: rgb(SUBTLE).into(),
@@ -74,11 +97,15 @@ impl DirectorySaver {
         });
         let _input_changed = cx.subscribe(&input, |this, _, _: &text_input::Changed, cx| {
             this.notice = None;
-            this.refresh(Keep::First, cx);
+            match this.mode {
+                InputMode::Search => this.refresh(Keep::First, cx),
+                InputMode::AddPath => cx.notify(),
+            }
         });
         let mut this = Self {
             store,
             input,
+            mode: InputMode::Search,
             results: Vec::new(),
             selected: None,
             notice: None,
@@ -91,7 +118,10 @@ impl DirectorySaver {
     }
 
     fn refresh(&mut self, keep: Keep, cx: &mut Context<Self>) {
-        let query = self.input.read(cx).content().to_owned();
+        let query = match self.mode {
+            InputMode::Search => self.input.read(cx).content().to_owned(),
+            InputMode::AddPath => String::new(),
+        };
         match self.store.search(&query) {
             Ok(results) => self.results = results,
             Err(err) => {
@@ -123,18 +153,51 @@ impl DirectorySaver {
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == InputMode::AddPath {
+            return;
+        }
         if let Some(ix) = self.selected {
             self.select(ix.saturating_sub(1), cx);
         }
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == InputMode::AddPath {
+            return;
+        }
         if let Some(ix) = self.selected {
             self.select((ix + 1).min(self.results.len() - 1), cx);
         }
     }
 
-    fn open_selected(&mut self, _: &OpenSelected, _: &mut Window, cx: &mut Context<Self>) {
+    /// Clears the input and switches what it is for. Callers refresh the results.
+    fn set_mode(&mut self, mode: InputMode, cx: &mut Context<Self>) {
+        self.mode = mode;
+        self.notice = None;
+        self.input.update(cx, |input, cx| {
+            input.set_placeholder(mode.placeholder(), cx);
+            input.set_content("", cx);
+        });
+    }
+
+    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        match self.mode {
+            InputMode::Search => self.open_selected(cx),
+            InputMode::AddPath => self.submit_path(cx),
+        }
+    }
+
+    fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
+        let keep = match self.mode {
+            InputMode::Search if self.input.read(cx).content().is_empty() => Keep::Index,
+            InputMode::Search => Keep::First,
+            InputMode::AddPath => Keep::Index,
+        };
+        self.set_mode(InputMode::Search, cx);
+        self.refresh(keep, cx);
+    }
+
+    fn open_selected(&mut self, cx: &mut Context<Self>) {
         let Some(dir) = self.selected.and_then(|ix| self.results.get(ix)).cloned() else {
             return;
         };
@@ -153,13 +216,52 @@ impl DirectorySaver {
         self.refresh(Keep::Id(dir.id), cx);
     }
 
-    fn clear_query(&mut self, _: &ClearQuery, _: &mut Window, cx: &mut Context<Self>) {
-        self.notice = None;
-        self.input.update(cx, |input, cx| input.clear(cx));
-        cx.notify();
+    fn paste_path(&mut self, _: &PastePath, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_mode(InputMode::AddPath, cx);
+        let clipboard = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .and_then(|text| paste::parse_pasted_path(&text, self.home.as_deref()))
+            .filter(|path| path.is_dir());
+        if let Some(path) = clipboard {
+            let text = path.to_string_lossy().into_owned();
+            self.input.update(cx, |input, cx| input.set_content(text, cx));
+        }
+        self.refresh(Keep::Index, cx);
     }
 
-    fn add_directory(&mut self, _: &AddDirectory, _: &mut Window, cx: &mut Context<Self>) {
+    fn check_path(&self, cx: &App) -> PathCheck {
+        let raw = self.input.read(cx).content();
+        if raw.trim().is_empty() {
+            return PathCheck::Empty;
+        }
+        match paste::parse_pasted_path(raw, self.home.as_deref()) {
+            None => PathCheck::Invalid("Not an absolute path"),
+            Some(path) if path.is_dir() => PathCheck::Ready(path),
+            Some(path) if path.exists() => PathCheck::Invalid("Not a directory"),
+            Some(_) => PathCheck::Invalid("Path does not exist"),
+        }
+    }
+
+    fn submit_path(&mut self, cx: &mut Context<Self>) {
+        match self.check_path(cx) {
+            PathCheck::Empty => {}
+            PathCheck::Invalid(reason) => {
+                self.notice = Some(Notice::Error(reason.into()));
+                cx.notify();
+            }
+            PathCheck::Ready(path) => {
+                self.set_mode(InputMode::Search, cx);
+                self.add_paths(Ok(Some(vec![path])), cx);
+            }
+        }
+    }
+
+    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == InputMode::AddPath {
+            self.set_mode(InputMode::Search, cx);
+            self.refresh(Keep::Index, cx);
+        }
         self.notice = None;
         let picked = cx.prompt_for_paths(PathPromptOptions {
             files: false,
@@ -197,12 +299,15 @@ impl DirectorySaver {
             ([one], None) => Some(Notice::Info(format!("Added {}", one.name).into())),
             (many, None) => Some(Notice::Info(format!("Added {} directories", many.len()).into())),
         };
-        self.input.update(cx, |input, cx| input.clear(cx));
+        self.input.update(cx, |input, cx| input.set_content("", cx));
         let keep = added.last().map_or(Keep::Index, |d| Keep::Id(d.id));
         self.refresh(keep, cx);
     }
 
     fn remove_selected(&mut self, _: &RemoveSelected, _: &mut Window, cx: &mut Context<Self>) {
+        if self.mode == InputMode::AddPath {
+            return;
+        }
         if let Some(ix) = self.selected {
             self.remove_at(ix, cx);
         }
@@ -360,10 +465,10 @@ impl DirectorySaver {
                             .child("Remove"),
                     ),
             )
-            .on_click(cx.listener(move |this, event: &ClickEvent, window, cx| {
+            .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.select(ix, cx);
                 if event.click_count() >= 2 {
-                    this.open_selected(&OpenSelected, window, cx);
+                    this.open_selected(cx);
                 }
             }))
     }
@@ -391,30 +496,38 @@ impl DirectorySaver {
             )
             .child(
                 div()
-                    .id("add")
-                    .h(px(28.))
-                    .pl(px(10.))
-                    .pr(px(4.))
                     .flex()
                     .items_center()
                     .gap(px(8.))
-                    .rounded(px(6.))
-                    .bg(rgb(ACCENT))
-                    .hover(|s| s.bg(rgb(0x6C78E0)))
-                    .cursor_pointer()
-                    .text_size(px(12.))
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(rgb(0xFFFFFF))
-                    .child("Add directory")
-                    .child(kbd("Ctrl N", rgba(0xFFFFFF26), rgba(0xFFFFFFCC)))
-                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                        this.add_directory(&AddDirectory, window, cx)
-                    })),
+                    .child(
+                        button("paste-path")
+                            .bg(rgb(SURFACE))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .text_color(rgb(TEXT))
+                            .child("Paste path")
+                            .child(kbd("Ctrl L", rgb(0x1E1F23), rgb(MUTED)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.paste_path(&PastePath, window, cx)
+                            })),
+                    )
+                    .child(
+                        button("open-folder")
+                            .bg(rgb(ACCENT))
+                            .hover(|s| s.bg(rgb(0x6C78E0)))
+                            .text_color(rgb(0xFFFFFF))
+                            .child("Open folder")
+                            .child(kbd("Ctrl N", rgba(0xFFFFFF26), rgba(0xFFFFFFCC)))
+                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                this.open_folder(&OpenFolder, window, cx)
+                            })),
+                    ),
             )
     }
 
     fn render_search(&self, cx: &App) -> impl IntoElement {
-        let has_query = !self.input.read(cx).content().is_empty();
+        let show_esc = self.mode == InputMode::AddPath || !self.input.read(cx).content().is_empty();
         div().px(px(16.)).pb(px(12.)).child(
             div()
                 .h(px(36.))
@@ -428,13 +541,46 @@ impl DirectorySaver {
                 .border_color(rgb(BORDER))
                 .text_size(px(13.))
                 .line_height(px(20.))
-                .child(search_glyph())
+                .child(match self.mode {
+                    InputMode::Search => search_glyph().into_any_element(),
+                    InputMode::AddPath => add_path_chip().into_any_element(),
+                })
                 .child(self.input.clone())
-                .when(has_query, |el| {
+                .when(show_esc, |el| {
                     el.child(kbd("Esc", rgb(0x1E1F23), rgb(SUBTLE)))
                 }),
         )
     }
+}
+
+fn button(id: &'static str) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .h(px(28.))
+        .pl(px(10.))
+        .pr(px(4.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .rounded(px(6.))
+        .cursor_pointer()
+        .text_size(px(12.))
+        .font_weight(FontWeight::MEDIUM)
+}
+
+fn add_path_chip() -> impl IntoElement {
+    div()
+        .flex_none()
+        .h(px(20.))
+        .px(px(6.))
+        .flex()
+        .items_center()
+        .rounded(px(4.))
+        .bg(rgba(0x5E6AD240))
+        .text_size(px(11.))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgb(0xB4BAF5))
+        .child("Add path")
 }
 
 fn kbd(label: &'static str, bg: impl Into<Hsla>, fg: impl Into<Hsla>) -> impl IntoElement {
@@ -500,7 +646,8 @@ impl Focusable for DirectorySaver {
 
 impl Render for DirectorySaver {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let query_empty = self.input.read(cx).content().is_empty();
+        let query_empty =
+            self.mode == InputMode::AddPath || self.input.read(cx).content().is_empty();
         let body = if !self.results.is_empty() {
             uniform_list(
                 "results",
@@ -515,7 +662,7 @@ impl Render for DirectorySaver {
             .into_any_element()
         } else {
             let (title, hint) = if query_empty {
-                ("No directories yet", "Press Ctrl N to add one")
+                ("No directories yet", "Press Ctrl N to pick a folder, or Ctrl L to paste a path")
             } else {
                 ("No results", "Try a different search, or press Esc to clear it")
             };
@@ -531,24 +678,35 @@ impl Render for DirectorySaver {
                 .into_any_element()
         };
 
-        let status: SharedString = match &self.notice {
-            Some(Notice::Error(msg) | Notice::Info(msg)) => msg.clone(),
-            None if self.results.len() == 1 => "1 directory".into(),
-            None => format!("{} directories", self.results.len()).into(),
+        let (status, status_color): (SharedString, _) = match (&self.notice, self.mode) {
+            (Some(Notice::Error(msg)), _) => (msg.clone(), rgb(DANGER)),
+            (Some(Notice::Info(msg)), _) => (msg.clone(), rgb(MUTED)),
+            (None, InputMode::AddPath) => match self.check_path(cx) {
+                PathCheck::Empty => ("Paste or type the full path of a folder".into(), rgb(SUBTLE)),
+                PathCheck::Ready(path) => (
+                    format!("Press Enter to add {}", self.display_path(&path)).into(),
+                    rgb(MUTED),
+                ),
+                PathCheck::Invalid(reason) => (reason.into(), rgb(SUBTLE)),
+            },
+            (None, InputMode::Search) if self.results.len() == 1 => ("1 directory".into(), rgb(SUBTLE)),
+            (None, InputMode::Search) => {
+                (format!("{} directories", self.results.len()).into(), rgb(SUBTLE))
+            }
         };
-        let status_color = match &self.notice {
-            Some(Notice::Error(_)) => rgb(DANGER),
-            Some(Notice::Info(_)) => rgb(MUTED),
-            None => rgb(SUBTLE),
+        let hints: &[&str] = match self.mode {
+            InputMode::Search => &["↑↓ navigate", "↵ open", "Ctrl ⌫ remove"],
+            InputMode::AddPath => &["↵ add", "Esc cancel"],
         };
 
         div()
             .key_context(CONTEXT)
             .on_action(cx.listener(Self::select_prev))
             .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::open_selected))
-            .on_action(cx.listener(Self::clear_query))
-            .on_action(cx.listener(Self::add_directory))
+            .on_action(cx.listener(Self::confirm))
+            .on_action(cx.listener(Self::cancel))
+            .on_action(cx.listener(Self::open_folder))
+            .on_action(cx.listener(Self::paste_path))
             .on_action(cx.listener(Self::remove_selected))
             .size_full()
             .flex()
@@ -577,9 +735,7 @@ impl Render for DirectorySaver {
                             .flex()
                             .gap(px(14.))
                             .text_color(rgb(SUBTLE))
-                            .child("↑↓ navigate")
-                            .child("↵ open")
-                            .child("Ctrl ⌫ remove"),
+                            .children(hints.iter().copied()),
                     ),
             )
     }
@@ -608,9 +764,10 @@ fn main() {
         cx.bind_keys([
             KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
             KeyBinding::new("down", SelectNext, Some(CONTEXT)),
-            KeyBinding::new("enter", OpenSelected, Some(CONTEXT)),
-            KeyBinding::new("escape", ClearQuery, Some(CONTEXT)),
-            KeyBinding::new("ctrl-n", AddDirectory, Some(CONTEXT)),
+            KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+            KeyBinding::new("escape", Cancel, Some(CONTEXT)),
+            KeyBinding::new("ctrl-n", OpenFolder, Some(CONTEXT)),
+            KeyBinding::new("ctrl-l", PastePath, Some(CONTEXT)),
             KeyBinding::new("ctrl-backspace", RemoveSelected, Some(CONTEXT)),
             KeyBinding::new("ctrl-q", Quit, None),
         ]);

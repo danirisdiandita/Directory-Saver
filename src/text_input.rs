@@ -80,15 +80,18 @@ impl TextInput {
         &self.content
     }
 
-    pub fn clear(&mut self, cx: &mut Context<Self>) {
-        if self.content.is_empty() {
-            return;
-        }
-        self.content = SharedString::default();
-        self.selected_range = 0..0;
+    /// Replaces the text and puts the cursor at the end. Emits no `Changed`: that event
+    /// is for user edits, and it is delivered after the caller's update has returned.
+    pub fn set_content(&mut self, text: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.content = text.into();
+        self.selected_range = self.content.len()..self.content.len();
         self.selection_reversed = false;
         self.marked_range = None;
-        cx.emit(Changed);
+        cx.notify();
+    }
+
+    pub fn set_placeholder(&mut self, placeholder: impl Into<SharedString>, cx: &mut Context<Self>) {
+        self.placeholder = placeholder.into();
         cx.notify();
     }
 
