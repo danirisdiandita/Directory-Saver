@@ -1,5 +1,6 @@
 mod paste;
 mod store;
+mod terminal;
 mod text_input;
 
 use std::path::{Path, PathBuf};
@@ -31,8 +32,8 @@ const ROW_HEIGHT: f32 = 44.;
 actions!(
     directory_saver,
     [
-        SelectPrev, SelectNext, Confirm, Cancel, AddFolder, RemoveSelected, DialogConfirm,
-        DialogCancel, Quit,
+        SelectPrev, SelectNext, Confirm, OpenTerminal, Cancel, AddFolder, RemoveSelected,
+        DialogConfirm, DialogCancel, Quit,
     ]
 );
 
@@ -43,6 +44,24 @@ enum Notice {
     Error(SharedString),
     Info(SharedString),
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum OpenWith {
+    Files,
+    Terminal,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum RowAction {
+    Open(OpenWith),
+    Remove,
+}
+
+const ROW_ACTIONS: [(RowAction, &str); 3] = [
+    (RowAction::Open(OpenWith::Terminal), "Terminal"),
+    (RowAction::Open(OpenWith::Files), "Files"),
+    (RowAction::Remove, "Remove"),
+];
 
 enum PathCheck {
     Empty,
@@ -88,6 +107,8 @@ struct DirectorySaver {
     add_dialog: Option<AddDialog>,
     results: Vec<Directory>,
     selected: Option<usize>,
+    hovered: Option<usize>,
+    hovered_action: Option<(usize, RowAction)>,
     notice: Option<Notice>,
     scroll: UniformListScrollHandle,
     home: Option<PathBuf>,
@@ -116,6 +137,8 @@ impl DirectorySaver {
             add_dialog: None,
             results: Vec::new(),
             selected: None,
+            hovered: None,
+            hovered_action: None,
             notice: None,
             scroll: UniformListScrollHandle::new(),
             home: dirs::home_dir(),
@@ -169,7 +192,15 @@ impl DirectorySaver {
     }
 
     fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        self.open_selected(cx);
+        if let Some(ix) = self.selected {
+            self.open_dir(ix, OpenWith::Files, cx);
+        }
+    }
+
+    fn open_terminal(&mut self, _: &OpenTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.selected {
+            self.open_dir(ix, OpenWith::Terminal, cx);
+        }
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -183,10 +214,11 @@ impl DirectorySaver {
         self.refresh(keep, cx);
     }
 
-    fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = self.selected.and_then(|ix| self.results.get(ix)).cloned() else {
+    fn open_dir(&mut self, ix: usize, with: OpenWith, cx: &mut Context<Self>) {
+        let Some(dir) = self.results.get(ix).cloned() else {
             return;
         };
+        self.selected = Some(ix);
         if !dir.path.is_dir() {
             self.notice = Some(Notice::Error(
                 format!("{} no longer exists", self.display_path(&dir.path)).into(),
@@ -194,10 +226,23 @@ impl DirectorySaver {
             cx.notify();
             return;
         }
-        cx.open_with_system(&dir.path);
+        let opened = match with {
+            OpenWith::Files => {
+                cx.open_with_system(&dir.path);
+                format!("Opened {} in Files", dir.name)
+            }
+            OpenWith::Terminal => match terminal::open(&dir.path) {
+                Ok(()) => format!("Opened terminal in {}", dir.name),
+                Err(err) => {
+                    self.notice = Some(Notice::Error(format!("{err:#}").into()));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
         self.notice = Some(match self.store.mark_opened(dir.id) {
-            Ok(()) => Notice::Info(format!("Opened {}", dir.name).into()),
-            Err(err) => Notice::Error(format!("Opened, but could not record it: {err:#}").into()),
+            Ok(()) => Notice::Info(opened.into()),
+            Err(err) => Notice::Error(format!("{opened}, but could not record it: {err:#}").into()),
         });
         self.refresh(Keep::Id(dir.id), cx);
     }
@@ -310,6 +355,13 @@ impl DirectorySaver {
         }
     }
 
+    fn run_row_action(&mut self, ix: usize, action: RowAction, cx: &mut Context<Self>) {
+        match action {
+            RowAction::Open(with) => self.open_dir(ix, with, cx),
+            RowAction::Remove => self.remove_at(ix, cx),
+        }
+    }
+
     fn remove_at(&mut self, ix: usize, cx: &mut Context<Self>) {
         let Some(dir) = self.results.get(ix).cloned() else {
             return;
@@ -334,7 +386,7 @@ impl DirectorySaver {
         let dir = &self.results[ix];
         let missing = !dir.path.is_dir();
         let selected = self.selected == Some(ix);
-        let group: SharedString = format!("row-{}", dir.id).into();
+        let show_actions = selected || self.hovered == Some(ix);
         let initial: String = dir.name.chars().next().map_or_else(String::new, |c| c.to_uppercase().collect());
         let meta = match dir.last_opened_at {
             Some(at) => format!("opened {}", relative_time(store::now() - at)),
@@ -343,7 +395,6 @@ impl DirectorySaver {
 
         div()
             .id(("row", dir.id as u64))
-            .group(group.clone())
             .w_full()
             .h(px(ROW_HEIGHT))
             .px(px(8.))
@@ -431,43 +482,80 @@ impl DirectorySaver {
                                     .child(self.display_path(&dir.path)),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(12.))
-                            .text_color(rgb(SUBTLE))
-                            .group_hover(group.clone(), |s| s.invisible())
-                            .child(meta),
-                    )
-                    .child(
-                        div()
-                            .id(("remove", dir.id as u64))
-                            .absolute()
-                            .right(px(8.))
-                            .px(px(8.))
-                            .h(px(24.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.))
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .hover(|s| s.bg(rgb(0x26272C)).text_color(rgb(DANGER)))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_at(ix, cx);
-                            }))
-                            .child("Remove"),
-                    ),
+                    .when(!show_actions, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(rgb(SUBTLE))
+                                .child(meta),
+                        )
+                    })
+                    .when(show_actions, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .children(ROW_ACTIONS.map(|(action, label)| {
+                                    self.render_row_button(ix, dir.id, action, label, cx)
+                                })),
+                        )
+                    }),
             )
+            // Hover is tracked in state rather than with hover styles because it changes
+            // layout and text color, which gpui only applies from state.
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered = Some(ix);
+                } else if this.hovered == Some(ix) {
+                    this.hovered = None;
+                }
+                cx.notify();
+            }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.select(ix, cx);
                 if event.click_count() >= 2 {
-                    this.open_selected(cx);
+                    this.open_dir(ix, OpenWith::Files, cx);
                 }
             }))
+    }
+
+    fn render_row_button(
+        &self,
+        ix: usize,
+        id: i64,
+        action: RowAction,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let hovered = self.hovered_action == Some((ix, action));
+        let hover_text = if action == RowAction::Remove { DANGER } else { TEXT };
+        div()
+            .id((label, id as u64))
+            .h(px(24.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .text_size(px(12.))
+            .text_color(rgb(if hovered { hover_text } else { MUTED }))
+            .when(hovered, |el| el.bg(rgb(0x26272C)))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered_action = Some((ix, action));
+                } else if this.hovered_action == Some((ix, action)) {
+                    this.hovered_action = None;
+                }
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_row_action(ix, action, cx);
+            }))
+            .child(label)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -795,6 +883,7 @@ impl Render for DirectorySaver {
                     .on_action(cx.listener(Self::select_prev))
                     .on_action(cx.listener(Self::select_next))
                     .on_action(cx.listener(Self::confirm))
+                    .on_action(cx.listener(Self::open_terminal))
                     .on_action(cx.listener(Self::cancel))
                     .on_action(cx.listener(Self::add_folder))
                     .on_action(cx.listener(Self::remove_selected))
@@ -821,7 +910,7 @@ impl Render for DirectorySaver {
                                     .flex()
                                     .gap(px(14.))
                                     .text_color(rgb(SUBTLE))
-                                    .children(["↑↓ navigate", "↵ open", "Ctrl ⌫ remove"]),
+                                    .children(["↑↓ navigate", "↵ open", "Ctrl ↵ terminal", "Ctrl ⌫ remove"]),
                             ),
                     ),
             )
@@ -853,6 +942,7 @@ fn main() {
             KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
             KeyBinding::new("down", SelectNext, Some(CONTEXT)),
             KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+            KeyBinding::new("ctrl-enter", OpenTerminal, Some(CONTEXT)),
             KeyBinding::new("escape", Cancel, Some(CONTEXT)),
             KeyBinding::new("ctrl-n", AddFolder, Some(CONTEXT)),
             KeyBinding::new("ctrl-backspace", RemoveSelected, Some(CONTEXT)),
