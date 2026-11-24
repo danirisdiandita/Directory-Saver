@@ -4,9 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+anyhow = "1.0.105"
+dirs = "7.0.0"
 gpui = "0.2.2"
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+unicode-segmentation = "1.13.3"
 
 # gpui 0.2.2 pulls xattr 0.2.3 (via zed-async-tar), which references libc::ENOATTR,
 # removed from libc 0.2.191 on Linux. Local patch swaps it for the equivalent ENODATA.
 [patch.crates-io]
 xattr = { path = "patches/xattr" }
+
+[dev-dependencies]
+tempfile = "3.27.0"
