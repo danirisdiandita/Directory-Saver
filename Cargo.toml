@@ -1,0 +1,12 @@
+[package]
+name = "directory-saver"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+gpui = "0.2.2"
+
+# gpui 0.2.2 pulls xattr 0.2.3 (via zed-async-tar), which references libc::ENOATTR,
+# removed from libc 0.2.191 on Linux. Local patch swaps it for the equivalent ENODATA.
+[patch.crates-io]
+xattr = { path = "patches/xattr" }
