@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Directory Saver
+GenericName=Directory Bookmarks
+Comment=Save folders and jump back to them in your file manager or terminal
+Exec=directory-saver
+Icon=directory-saver
+Terminal=false
+Categories=Utility;FileTools;
+Keywords=folder;directory;bookmark;launcher;
+StartupWMClass=directory-saver

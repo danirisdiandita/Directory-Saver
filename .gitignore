@@ -35,3 +35,6 @@ perf.data*
 flamegraph.svg
 *.png
 !assets/**/*.png
+
+# Release packages
+/dist/

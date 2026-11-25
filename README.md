@@ -4,27 +4,39 @@ A small, keyboard-driven desktop app for bookmarking the directories you use oft
 
 ## Features
 
-- **Save directories** from a native folder picker (you can pick several at once) or by pasting a path.
+- **Save directories** from one Add folder dialog. Paste a path or browse with the native folder picker. Only real folders get saved.
 - **Paste-friendly paths.** Accepts absolute paths, `~` and `~/…`, quoted paths, and `file://` URIs (percent-encoded too).
 - **Instant search** across directory names and paths. Every word in the query must match, and names that start with the query rank first.
 - **Recent first.** Results are ordered by when you last opened them, then by when you added them.
-- **Open in your file manager** with Enter, using the system default handler.
+- **Open in your file manager or a terminal.** Each row has Files and Terminal buttons. The terminal starts inside the folder (uses `$TERMINAL`, then gnome-terminal, konsole, kitty, alacritty, wezterm, xterm and others).
 - **Stays local.** Everything is stored in a local SQLite database. No accounts, no network.
 
 ## Keyboard shortcuts
 
-| Key              | Action                                            |
-| ---------------- | ------------------------------------------------- |
-| Type             | Search saved directories                          |
-| `↑` / `↓`        | Move the selection                                |
-| `Enter`          | Open the selected directory (or add a pasted path) |
-| `Esc`            | Clear the search, or leave paste mode             |
-| `Ctrl+N`         | Add directories with the folder picker            |
-| `Ctrl+L`         | Paste a path (pre-fills from the clipboard)       |
-| `Ctrl+Backspace` | Remove the selected directory from the list       |
-| `Ctrl+Q`         | Quit                                              |
+| Key              | Action                                          |
+| ---------------- | ----------------------------------------------- |
+| Type             | Search saved directories                        |
+| `↑` / `↓`        | Move the selection                              |
+| `Enter`          | Open the selected directory in the file manager |
+| `Ctrl+Enter`     | Open a terminal in the selected directory       |
+| `Esc`            | Clear the search, or close the Add folder dialog |
+| `Ctrl+N`         | Open the Add folder dialog                      |
+| `Ctrl+Backspace` | Remove the selected directory from the list     |
+| `Ctrl+Q`         | Quit                                            |
 
 Removing a directory only deletes the bookmark. Nothing on disk is touched.
+
+## Install on Linux
+
+Download or build `directory-saver-<version>-x86_64-linux.tar.gz`, then:
+
+```sh
+tar xzf directory-saver-*-linux.tar.gz
+cd directory-saver-*-linux
+./install.sh        # installs to ~/.local (set PREFIX=/usr/local with sudo for system-wide)
+```
+
+Directory Saver then shows up in your app launcher with its icon. `./uninstall.sh` removes it and keeps your saved directories.
 
 ## Data location
 
@@ -58,6 +70,14 @@ cd Directory-Saver
 cargo run --release
 ```
 
+### Build a Linux package
+
+```sh
+./scripts/build-linux.sh    # writes dist/directory-saver-<version>-<arch>-linux.tar.gz
+```
+
+The package holds the release binary, a `.desktop` entry, the icon set (`assets/icons`, rendered from `assets/icon.svg`) and the install scripts.
+
 ### Develop
 
 ```sh
@@ -76,6 +96,10 @@ src/
   text_input.rs  single-line text input component for gpui
   store.rs       SQLite store: migrations, add, search, remove, last-opened tracking
   paste.rs       turns pasted text (~, quotes, file:// URIs) into absolute paths
+  terminal.rs    finds a terminal emulator and opens it in a directory
+assets/          app icon (icon.svg) and rendered hicolor PNGs
+packaging/       .desktop entry, install.sh and uninstall.sh
+scripts/         build-linux.sh release packager
 patches/xattr    local patch for a libc incompatibility (see below)
 ```
 
