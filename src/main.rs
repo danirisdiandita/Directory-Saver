@@ -1,5 +1,6 @@
 mod paste;
 mod store;
+mod terminal;
 mod text_input;
 
 use std::path::{Path, PathBuf};
@@ -30,36 +31,67 @@ const ROW_HEIGHT: f32 = 44.;
 
 actions!(
     directory_saver,
-    [SelectPrev, SelectNext, Confirm, Cancel, OpenFolder, PastePath, RemoveSelected, Quit]
+    [
+        SelectPrev, SelectNext, Confirm, OpenTerminal, Cancel, AddFolder, RemoveSelected,
+        DialogConfirm, DialogCancel, Quit,
+    ]
 );
 
 const CONTEXT: &str = "DirectorySaver";
+const DIALOG_CONTEXT: &str = "AddDialog";
 
 enum Notice {
     Error(SharedString),
     Info(SharedString),
 }
 
-/// What the one text input is for right now.
 #[derive(Clone, Copy, PartialEq)]
-enum InputMode {
-    Search,
-    AddPath,
+enum OpenWith {
+    Files,
+    Terminal,
 }
 
-impl InputMode {
-    fn placeholder(self) -> &'static str {
-        match self {
-            InputMode::Search => "Search directories…",
-            InputMode::AddPath => "Paste a directory path…",
-        }
-    }
+#[derive(Clone, Copy, PartialEq)]
+enum RowAction {
+    Open(OpenWith),
+    Remove,
 }
+
+const ROW_ACTIONS: [(RowAction, &str); 3] = [
+    (RowAction::Open(OpenWith::Terminal), "Terminal"),
+    (RowAction::Open(OpenWith::Files), "Files"),
+    (RowAction::Remove, "Remove"),
+];
 
 enum PathCheck {
     Empty,
     Ready(PathBuf),
     Invalid(&'static str),
+}
+
+fn check_path(raw: &str, home: Option<&Path>) -> PathCheck {
+    if raw.trim().is_empty() {
+        return PathCheck::Empty;
+    }
+    match paste::parse_pasted_path(raw, home) {
+        None => PathCheck::Invalid("Not an absolute path"),
+        Some(path) if path.is_dir() => PathCheck::Ready(path),
+        Some(path) if path.exists() => PathCheck::Invalid("Not a folder"),
+        Some(_) => PathCheck::Invalid("Folder does not exist"),
+    }
+}
+
+/// What the dialog's validation line says.
+enum DialogStatus {
+    Check(PathCheck),
+    /// A submit or the folder picker failed; stays until the field changes.
+    Error(SharedString),
+}
+
+struct AddDialog {
+    input: Entity<TextInput>,
+    status: DialogStatus,
+    _changed: Subscription,
 }
 
 /// Which row should be selected once results are reloaded.
@@ -72,42 +104,41 @@ enum Keep {
 struct DirectorySaver {
     store: Store,
     input: Entity<TextInput>,
-    mode: InputMode,
+    add_dialog: Option<AddDialog>,
     results: Vec<Directory>,
     selected: Option<usize>,
+    hovered: Option<usize>,
+    hovered_action: Option<(usize, RowAction)>,
     notice: Option<Notice>,
     scroll: UniformListScrollHandle,
     home: Option<PathBuf>,
     _input_changed: Subscription,
 }
 
+fn input_colors() -> InputColors {
+    InputColors {
+        text: rgb(TEXT).into(),
+        placeholder: rgb(SUBTLE).into(),
+        cursor: rgb(ACCENT).into(),
+        selection: rgba(0x5E6AD266).into(),
+    }
+}
+
 impl DirectorySaver {
     fn new(store: Store, cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| {
-            TextInput::new(
-                InputMode::Search.placeholder(),
-                InputColors {
-                    text: rgb(TEXT).into(),
-                    placeholder: rgb(SUBTLE).into(),
-                    cursor: rgb(ACCENT).into(),
-                    selection: rgba(0x5E6AD266).into(),
-                },
-                cx,
-            )
-        });
+        let input = cx.new(|cx| TextInput::new("Search directories…", input_colors(), cx));
         let _input_changed = cx.subscribe(&input, |this, _, _: &text_input::Changed, cx| {
             this.notice = None;
-            match this.mode {
-                InputMode::Search => this.refresh(Keep::First, cx),
-                InputMode::AddPath => cx.notify(),
-            }
+            this.refresh(Keep::First, cx);
         });
         let mut this = Self {
             store,
             input,
-            mode: InputMode::Search,
+            add_dialog: None,
             results: Vec::new(),
             selected: None,
+            hovered: None,
+            hovered_action: None,
             notice: None,
             scroll: UniformListScrollHandle::new(),
             home: dirs::home_dir(),
@@ -118,11 +149,7 @@ impl DirectorySaver {
     }
 
     fn refresh(&mut self, keep: Keep, cx: &mut Context<Self>) {
-        let query = match self.mode {
-            InputMode::Search => self.input.read(cx).content().to_owned(),
-            InputMode::AddPath => String::new(),
-        };
-        match self.store.search(&query) {
+        match self.store.search(self.input.read(cx).content()) {
             Ok(results) => self.results = results,
             Err(err) => {
                 self.results.clear();
@@ -153,54 +180,45 @@ impl DirectorySaver {
     }
 
     fn select_prev(&mut self, _: &SelectPrev, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == InputMode::AddPath {
-            return;
-        }
         if let Some(ix) = self.selected {
             self.select(ix.saturating_sub(1), cx);
         }
     }
 
     fn select_next(&mut self, _: &SelectNext, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == InputMode::AddPath {
-            return;
-        }
         if let Some(ix) = self.selected {
             self.select((ix + 1).min(self.results.len() - 1), cx);
         }
     }
 
-    /// Clears the input and switches what it is for. Callers refresh the results.
-    fn set_mode(&mut self, mode: InputMode, cx: &mut Context<Self>) {
-        self.mode = mode;
-        self.notice = None;
-        self.input.update(cx, |input, cx| {
-            input.set_placeholder(mode.placeholder(), cx);
-            input.set_content("", cx);
-        });
+    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.selected {
+            self.open_dir(ix, OpenWith::Files, cx);
+        }
     }
 
-    fn confirm(&mut self, _: &Confirm, _: &mut Window, cx: &mut Context<Self>) {
-        match self.mode {
-            InputMode::Search => self.open_selected(cx),
-            InputMode::AddPath => self.submit_path(cx),
+    fn open_terminal(&mut self, _: &OpenTerminal, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.selected {
+            self.open_dir(ix, OpenWith::Terminal, cx);
         }
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
-        let keep = match self.mode {
-            InputMode::Search if self.input.read(cx).content().is_empty() => Keep::Index,
-            InputMode::Search => Keep::First,
-            InputMode::AddPath => Keep::Index,
+        let keep = if self.input.read(cx).content().is_empty() {
+            Keep::Index
+        } else {
+            Keep::First
         };
-        self.set_mode(InputMode::Search, cx);
+        self.notice = None;
+        self.input.update(cx, |input, cx| input.set_content("", cx));
         self.refresh(keep, cx);
     }
 
-    fn open_selected(&mut self, cx: &mut Context<Self>) {
-        let Some(dir) = self.selected.and_then(|ix| self.results.get(ix)).cloned() else {
+    fn open_dir(&mut self, ix: usize, with: OpenWith, cx: &mut Context<Self>) {
+        let Some(dir) = self.results.get(ix).cloned() else {
             return;
         };
+        self.selected = Some(ix);
         if !dir.path.is_dir() {
             self.notice = Some(Notice::Error(
                 format!("{} no longer exists", self.display_path(&dir.path)).into(),
@@ -208,108 +226,139 @@ impl DirectorySaver {
             cx.notify();
             return;
         }
-        cx.open_with_system(&dir.path);
+        let opened = match with {
+            OpenWith::Files => {
+                cx.open_with_system(&dir.path);
+                format!("Opened {} in Files", dir.name)
+            }
+            OpenWith::Terminal => match terminal::open(&dir.path) {
+                Ok(()) => format!("Opened terminal in {}", dir.name),
+                Err(err) => {
+                    self.notice = Some(Notice::Error(format!("{err:#}").into()));
+                    cx.notify();
+                    return;
+                }
+            },
+        };
         self.notice = Some(match self.store.mark_opened(dir.id) {
-            Ok(()) => Notice::Info(format!("Opened {}", dir.name).into()),
-            Err(err) => Notice::Error(format!("Opened, but could not record it: {err:#}").into()),
+            Ok(()) => Notice::Info(opened.into()),
+            Err(err) => Notice::Error(format!("{opened}, but could not record it: {err:#}").into()),
         });
         self.refresh(Keep::Id(dir.id), cx);
     }
 
-    fn paste_path(&mut self, _: &PastePath, _: &mut Window, cx: &mut Context<Self>) {
-        self.set_mode(InputMode::AddPath, cx);
-        let clipboard = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-            .and_then(|text| paste::parse_pasted_path(&text, self.home.as_deref()))
-            .filter(|path| path.is_dir());
-        if let Some(path) = clipboard {
-            let text = path.to_string_lossy().into_owned();
-            self.input.update(cx, |input, cx| input.set_content(text, cx));
+    fn add_folder(&mut self, _: &AddFolder, window: &mut Window, cx: &mut Context<Self>) {
+        if self.add_dialog.is_some() {
+            return;
         }
-        self.refresh(Keep::Index, cx);
-    }
-
-    fn check_path(&self, cx: &App) -> PathCheck {
-        let raw = self.input.read(cx).content();
-        if raw.trim().is_empty() {
-            return PathCheck::Empty;
-        }
-        match paste::parse_pasted_path(raw, self.home.as_deref()) {
-            None => PathCheck::Invalid("Not an absolute path"),
-            Some(path) if path.is_dir() => PathCheck::Ready(path),
-            Some(path) if path.exists() => PathCheck::Invalid("Not a directory"),
-            Some(_) => PathCheck::Invalid("Path does not exist"),
-        }
-    }
-
-    fn submit_path(&mut self, cx: &mut Context<Self>) {
-        match self.check_path(cx) {
-            PathCheck::Empty => {}
-            PathCheck::Invalid(reason) => {
-                self.notice = Some(Notice::Error(reason.into()));
-                cx.notify();
-            }
-            PathCheck::Ready(path) => {
-                self.set_mode(InputMode::Search, cx);
-                self.add_paths(Ok(Some(vec![path])), cx);
-            }
-        }
-    }
-
-    fn open_folder(&mut self, _: &OpenFolder, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == InputMode::AddPath {
-            self.set_mode(InputMode::Search, cx);
-            self.refresh(Keep::Index, cx);
-        }
-        self.notice = None;
-        let picked = cx.prompt_for_paths(PathPromptOptions {
-            files: false,
-            directories: true,
-            multiple: true,
-            prompt: Some("Add".into()),
+        let input = cx.new(|cx| TextInput::new("Paste a folder path…", input_colors(), cx));
+        let _changed = cx.subscribe(&input, |this, _, _: &text_input::Changed, cx| {
+            this.recheck_dialog(cx);
         });
-        cx.spawn(async move |this, cx| {
-            let picked = picked.await.map_err(anyhow::Error::from).and_then(|r| r);
-            this.update(cx, |this, cx| this.add_paths(picked, cx)).ok();
-        })
-        .detach();
+        window.focus(&input.focus_handle(cx));
+        self.notice = None;
+        self.add_dialog = Some(AddDialog {
+            input,
+            status: DialogStatus::Check(PathCheck::Empty),
+            _changed,
+        });
+        cx.notify();
     }
 
-    fn add_paths(&mut self, picked: Result<Option<Vec<PathBuf>>>, cx: &mut Context<Self>) {
-        let paths = match picked {
-            Ok(Some(paths)) => paths,
-            Ok(None) => return,
+    fn recheck_dialog(&mut self, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.add_dialog else {
+            return;
+        };
+        let check = check_path(dialog.input.read(cx).content(), self.home.as_deref());
+        dialog.status = DialogStatus::Check(check);
+        cx.notify();
+    }
+
+    fn close_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.add_dialog = None;
+        window.focus(&self.input.focus_handle(cx));
+        cx.notify();
+    }
+
+    fn dialog_cancel(&mut self, _: &DialogCancel, window: &mut Window, cx: &mut Context<Self>) {
+        self.close_dialog(window, cx);
+    }
+
+    fn dialog_confirm(&mut self, _: &DialogConfirm, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.add_dialog else {
+            return;
+        };
+        // Checked again here because the folder may have changed since the field was edited.
+        let path = match check_path(dialog.input.read(cx).content(), self.home.as_deref()) {
+            PathCheck::Empty => return,
+            PathCheck::Invalid(reason) => {
+                dialog.status = DialogStatus::Error(reason.into());
+                cx.notify();
+                return;
+            }
+            PathCheck::Ready(path) => path,
+        };
+        let added = match self.store.add(&path) {
+            Ok(added) => added,
             Err(err) => {
-                self.notice = Some(Notice::Error(format!("Could not open picker: {err:#}").into()));
+                dialog.status = DialogStatus::Error(format!("{err:#}").into());
                 cx.notify();
                 return;
             }
         };
-        let mut added = Vec::new();
-        let mut failures = Vec::new();
-        for path in &paths {
-            match self.store.add(path) {
-                Ok(dir) => added.push(dir),
-                Err(err) => failures.push(format!("{err:#}")),
+        self.close_dialog(window, cx);
+        let verb = if added.is_new { "Added" } else { "Already saved" };
+        self.notice = Some(Notice::Info(format!("{verb} {}", added.dir.name).into()));
+        self.input.update(cx, |input, cx| input.set_content("", cx));
+        self.refresh(Keep::Id(added.dir.id), cx);
+    }
+
+    fn browse(&mut self, cx: &mut Context<Self>) {
+        let picked = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let picked = picked.await.map_err(anyhow::Error::from).and_then(|r| r);
+            this.update(cx, |this, cx| this.use_picked(picked, cx)).ok();
+        })
+        .detach();
+    }
+
+    fn use_picked(&mut self, picked: Result<Option<Vec<PathBuf>>>, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.add_dialog else {
+            return;
+        };
+        match picked {
+            Ok(Some(paths)) => {
+                let Some(path) = paths.into_iter().next() else {
+                    return;
+                };
+                let text = path.to_string_lossy().into_owned();
+                dialog.input.update(cx, |input, cx| input.set_content(text, cx));
+                self.recheck_dialog(cx);
+            }
+            Ok(None) => {}
+            Err(err) => {
+                dialog.status =
+                    DialogStatus::Error(format!("Could not open folder picker: {err:#}").into());
+                cx.notify();
             }
         }
-        self.notice = match (added.as_slice(), failures.first()) {
-            (_, Some(first)) => Some(Notice::Error(first.clone().into())),
-            ([one], None) => Some(Notice::Info(format!("Added {}", one.name).into())),
-            (many, None) => Some(Notice::Info(format!("Added {} directories", many.len()).into())),
-        };
-        self.input.update(cx, |input, cx| input.set_content("", cx));
-        let keep = added.last().map_or(Keep::Index, |d| Keep::Id(d.id));
-        self.refresh(keep, cx);
     }
 
     fn remove_selected(&mut self, _: &RemoveSelected, _: &mut Window, cx: &mut Context<Self>) {
-        if self.mode == InputMode::AddPath {
-            return;
-        }
         if let Some(ix) = self.selected {
             self.remove_at(ix, cx);
+        }
+    }
+
+    fn run_row_action(&mut self, ix: usize, action: RowAction, cx: &mut Context<Self>) {
+        match action {
+            RowAction::Open(with) => self.open_dir(ix, with, cx),
+            RowAction::Remove => self.remove_at(ix, cx),
         }
     }
 
@@ -337,7 +386,7 @@ impl DirectorySaver {
         let dir = &self.results[ix];
         let missing = !dir.path.is_dir();
         let selected = self.selected == Some(ix);
-        let group: SharedString = format!("row-{}", dir.id).into();
+        let show_actions = selected || self.hovered == Some(ix);
         let initial: String = dir.name.chars().next().map_or_else(String::new, |c| c.to_uppercase().collect());
         let meta = match dir.last_opened_at {
             Some(at) => format!("opened {}", relative_time(store::now() - at)),
@@ -346,7 +395,6 @@ impl DirectorySaver {
 
         div()
             .id(("row", dir.id as u64))
-            .group(group.clone())
             .w_full()
             .h(px(ROW_HEIGHT))
             .px(px(8.))
@@ -434,43 +482,80 @@ impl DirectorySaver {
                                     .child(self.display_path(&dir.path)),
                             ),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(12.))
-                            .text_color(rgb(SUBTLE))
-                            .group_hover(group.clone(), |s| s.invisible())
-                            .child(meta),
-                    )
-                    .child(
-                        div()
-                            .id(("remove", dir.id as u64))
-                            .absolute()
-                            .right(px(8.))
-                            .px(px(8.))
-                            .h(px(24.))
-                            .flex()
-                            .items_center()
-                            .rounded(px(6.))
-                            .text_size(px(12.))
-                            .text_color(rgb(MUTED))
-                            .invisible()
-                            .group_hover(group, |s| s.visible())
-                            .hover(|s| s.bg(rgb(0x26272C)).text_color(rgb(DANGER)))
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
-                                cx.stop_propagation();
-                                this.remove_at(ix, cx);
-                            }))
-                            .child("Remove"),
-                    ),
+                    .when(!show_actions, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .text_size(px(12.))
+                                .text_color(rgb(SUBTLE))
+                                .child(meta),
+                        )
+                    })
+                    .when(show_actions, |el| {
+                        el.child(
+                            div()
+                                .flex_none()
+                                .flex()
+                                .items_center()
+                                .gap(px(2.))
+                                .children(ROW_ACTIONS.map(|(action, label)| {
+                                    self.render_row_button(ix, dir.id, action, label, cx)
+                                })),
+                        )
+                    }),
             )
+            // Hover is tracked in state rather than with hover styles because it changes
+            // layout and text color, which gpui only applies from state.
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered = Some(ix);
+                } else if this.hovered == Some(ix) {
+                    this.hovered = None;
+                }
+                cx.notify();
+            }))
             .on_click(cx.listener(move |this, event: &ClickEvent, _, cx| {
                 this.select(ix, cx);
                 if event.click_count() >= 2 {
-                    this.open_selected(cx);
+                    this.open_dir(ix, OpenWith::Files, cx);
                 }
             }))
+    }
+
+    fn render_row_button(
+        &self,
+        ix: usize,
+        id: i64,
+        action: RowAction,
+        label: &'static str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let hovered = self.hovered_action == Some((ix, action));
+        let hover_text = if action == RowAction::Remove { DANGER } else { TEXT };
+        div()
+            .id((label, id as u64))
+            .h(px(24.))
+            .px(px(8.))
+            .flex()
+            .items_center()
+            .rounded(px(6.))
+            .text_size(px(12.))
+            .text_color(rgb(if hovered { hover_text } else { MUTED }))
+            .when(hovered, |el| el.bg(rgb(0x26272C)))
+            .cursor_pointer()
+            .on_hover(cx.listener(move |this, hovered: &bool, _, cx| {
+                if *hovered {
+                    this.hovered_action = Some((ix, action));
+                } else if this.hovered_action == Some((ix, action)) {
+                    this.hovered_action = None;
+                }
+                cx.notify();
+            }))
+            .on_click(cx.listener(move |this, _: &ClickEvent, _, cx| {
+                cx.stop_propagation();
+                this.run_row_action(ix, action, cx);
+            }))
+            .child(label)
     }
 
     fn render_header(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -495,62 +580,165 @@ impl DirectorySaver {
                     ),
             )
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap(px(8.))
-                    .child(
-                        button("paste-path")
-                            .bg(rgb(SURFACE))
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .hover(|s| s.bg(rgb(HOVER)))
-                            .text_color(rgb(TEXT))
-                            .child("Paste path")
-                            .child(kbd("Ctrl L", rgb(0x1E1F23), rgb(MUTED)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.paste_path(&PastePath, window, cx)
-                            })),
-                    )
-                    .child(
-                        button("open-folder")
-                            .bg(rgb(ACCENT))
-                            .hover(|s| s.bg(rgb(0x6C78E0)))
-                            .text_color(rgb(0xFFFFFF))
-                            .child("Open folder")
-                            .child(kbd("Ctrl N", rgba(0xFFFFFF26), rgba(0xFFFFFFCC)))
-                            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
-                                this.open_folder(&OpenFolder, window, cx)
-                            })),
-                    ),
+                button("add-folder")
+                    .bg(rgb(ACCENT))
+                    .hover(|s| s.bg(rgb(0x6C78E0)))
+                    .text_color(rgb(0xFFFFFF))
+                    .child("Add folder")
+                    .child(kbd("Ctrl N", rgba(0xFFFFFF26), rgba(0xFFFFFFCC)))
+                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                        this.add_folder(&AddFolder, window, cx)
+                    })),
             )
     }
 
     fn render_search(&self, cx: &App) -> impl IntoElement {
-        let show_esc = self.mode == InputMode::AddPath || !self.input.read(cx).content().is_empty();
+        let show_esc = !self.input.read(cx).content().is_empty();
         div().px(px(16.)).pb(px(12.)).child(
-            div()
-                .h(px(36.))
-                .px(px(10.))
-                .flex()
-                .items_center()
-                .gap(px(8.))
-                .rounded(px(6.))
-                .bg(rgb(SURFACE))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .text_size(px(13.))
-                .line_height(px(20.))
-                .child(match self.mode {
-                    InputMode::Search => search_glyph().into_any_element(),
-                    InputMode::AddPath => add_path_chip().into_any_element(),
-                })
+            field()
+                .child(search_glyph())
                 .child(self.input.clone())
                 .when(show_esc, |el| {
                     el.child(kbd("Esc", rgb(0x1E1F23), rgb(SUBTLE)))
                 }),
         )
     }
+
+    fn render_dialog(&self, dialog: &AddDialog, cx: &mut Context<Self>) -> impl IntoElement {
+        let ready = matches!(dialog.status, DialogStatus::Check(PathCheck::Ready(_)));
+        let validation = match &dialog.status {
+            DialogStatus::Check(PathCheck::Empty) => None,
+            DialogStatus::Check(PathCheck::Ready(path)) => Some(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.))
+                    .text_color(rgb(MUTED))
+                    .child(div().size(px(6.)).flex_none().rounded_full().bg(rgb(ACCENT)))
+                    .child(div().truncate().child(self.display_path(path))),
+            ),
+            DialogStatus::Check(PathCheck::Invalid(reason)) => {
+                Some(div().text_color(rgb(SUBTLE)).child(*reason))
+            }
+            DialogStatus::Error(msg) => {
+                Some(div().truncate().text_color(rgb(DANGER)).child(msg.clone()))
+            }
+        };
+
+        let card = div()
+            .id("add-dialog")
+            .key_context(DIALOG_CONTEXT)
+            .on_action(cx.listener(Self::dialog_confirm))
+            .on_action(cx.listener(Self::dialog_cancel))
+            .occlude()
+            .w(px(440.))
+            .p(px(16.))
+            .flex()
+            .flex_col()
+            .rounded(px(8.))
+            .bg(rgb(SURFACE))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .shadow_lg()
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(rgb(TEXT))
+                    .child("Add folder"),
+            )
+            .child(
+                div()
+                    .mt(px(2.))
+                    .text_size(px(12.))
+                    .text_color(rgb(MUTED))
+                    .child("Paste a path or browse for a folder."),
+            )
+            .child(field().mt(px(14.)).bg(rgb(BG)).child(dialog.input.clone()))
+            .child(
+                div()
+                    .h(px(18.))
+                    .mt(px(6.))
+                    .text_size(px(12.))
+                    .children(validation),
+            )
+            .child(
+                div()
+                    .mt(px(10.))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        dialog_button("browse")
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .hover(|s| s.bg(rgb(HOVER)))
+                            .cursor_pointer()
+                            .text_color(rgb(TEXT))
+                            .child("Browse…")
+                            .on_click(cx.listener(|this, _: &ClickEvent, _, cx| this.browse(cx))),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.))
+                            .child(
+                                dialog_button("cancel")
+                                    .hover(|s| s.bg(rgb(HOVER)))
+                                    .cursor_pointer()
+                                    .text_color(rgb(MUTED))
+                                    .child("Cancel")
+                                    .on_click(cx.listener(|this, _: &ClickEvent, window, cx| {
+                                        this.close_dialog(window, cx)
+                                    })),
+                            )
+                            .child(
+                                dialog_button("add")
+                                    .bg(rgb(ACCENT))
+                                    .text_color(rgb(0xFFFFFF))
+                                    .when(!ready, |el| el.opacity(0.4))
+                                    .when(ready, |el| {
+                                        el.cursor_pointer()
+                                            .hover(|s| s.bg(rgb(0x6C78E0)))
+                                            .on_click(cx.listener(
+                                                |this, _: &ClickEvent, window, cx| {
+                                                    this.dialog_confirm(&DialogConfirm, window, cx)
+                                                },
+                                            ))
+                                    })
+                                    .child("Add"),
+                            ),
+                    ),
+            );
+
+        div()
+            .id("add-dialog-backdrop")
+            .absolute()
+            .inset_0()
+            .occlude()
+            .bg(rgba(0x00000099))
+            .flex()
+            .items_center()
+            .justify_center()
+            .on_click(cx.listener(|this, _: &ClickEvent, window, cx| this.close_dialog(window, cx)))
+            .child(card)
+    }
+}
+
+fn field() -> gpui::Div {
+    div()
+        .h(px(36.))
+        .px(px(10.))
+        .flex()
+        .items_center()
+        .gap(px(8.))
+        .overflow_hidden()
+        .rounded(px(6.))
+        .bg(rgb(SURFACE))
+        .border_1()
+        .border_color(rgb(BORDER))
+        .text_size(px(13.))
+        .line_height(px(20.))
 }
 
 fn button(id: &'static str) -> gpui::Stateful<gpui::Div> {
@@ -568,19 +756,16 @@ fn button(id: &'static str) -> gpui::Stateful<gpui::Div> {
         .font_weight(FontWeight::MEDIUM)
 }
 
-fn add_path_chip() -> impl IntoElement {
+fn dialog_button(id: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
-        .flex_none()
-        .h(px(20.))
-        .px(px(6.))
+        .id(id)
+        .h(px(28.))
+        .px(px(12.))
         .flex()
         .items_center()
-        .rounded(px(4.))
-        .bg(rgba(0x5E6AD240))
-        .text_size(px(11.))
+        .rounded(px(6.))
+        .text_size(px(12.))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(rgb(0xB4BAF5))
-        .child("Add path")
 }
 
 fn kbd(label: &'static str, bg: impl Into<Hsla>, fg: impl Into<Hsla>) -> impl IntoElement {
@@ -646,8 +831,6 @@ impl Focusable for DirectorySaver {
 
 impl Render for DirectorySaver {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let query_empty =
-            self.mode == InputMode::AddPath || self.input.read(cx).content().is_empty();
         let body = if !self.results.is_empty() {
             uniform_list(
                 "results",
@@ -661,8 +844,8 @@ impl Render for DirectorySaver {
             .flex_1()
             .into_any_element()
         } else {
-            let (title, hint) = if query_empty {
-                ("No directories yet", "Press Ctrl N to pick a folder, or Ctrl L to paste a path")
+            let (title, hint) = if self.input.read(cx).content().is_empty() {
+                ("No directories yet", "Press Ctrl N to add a folder")
             } else {
                 ("No results", "Try a different search, or press Esc to clear it")
             };
@@ -678,66 +861,60 @@ impl Render for DirectorySaver {
                 .into_any_element()
         };
 
-        let (status, status_color): (SharedString, _) = match (&self.notice, self.mode) {
-            (Some(Notice::Error(msg)), _) => (msg.clone(), rgb(DANGER)),
-            (Some(Notice::Info(msg)), _) => (msg.clone(), rgb(MUTED)),
-            (None, InputMode::AddPath) => match self.check_path(cx) {
-                PathCheck::Empty => ("Paste or type the full path of a folder".into(), rgb(SUBTLE)),
-                PathCheck::Ready(path) => (
-                    format!("Press Enter to add {}", self.display_path(&path)).into(),
-                    rgb(MUTED),
-                ),
-                PathCheck::Invalid(reason) => (reason.into(), rgb(SUBTLE)),
-            },
-            (None, InputMode::Search) if self.results.len() == 1 => ("1 directory".into(), rgb(SUBTLE)),
-            (None, InputMode::Search) => {
-                (format!("{} directories", self.results.len()).into(), rgb(SUBTLE))
-            }
-        };
-        let hints: &[&str] = match self.mode {
-            InputMode::Search => &["↑↓ navigate", "↵ open", "Ctrl ⌫ remove"],
-            InputMode::AddPath => &["↵ add", "Esc cancel"],
+        let (status, status_color): (SharedString, _) = match &self.notice {
+            Some(Notice::Error(msg)) => (msg.clone(), rgb(DANGER)),
+            Some(Notice::Info(msg)) => (msg.clone(), rgb(MUTED)),
+            None if self.results.len() == 1 => ("1 directory".into(), rgb(SUBTLE)),
+            None => (format!("{} directories", self.results.len()).into(), rgb(SUBTLE)),
         };
 
+        // The dialog sits outside the DirectorySaver key context so Enter, Esc and
+        // Ctrl ⌫ typed into it never reach the list behind it.
         div()
-            .key_context(CONTEXT)
-            .on_action(cx.listener(Self::select_prev))
-            .on_action(cx.listener(Self::select_next))
-            .on_action(cx.listener(Self::confirm))
-            .on_action(cx.listener(Self::cancel))
-            .on_action(cx.listener(Self::open_folder))
-            .on_action(cx.listener(Self::paste_path))
-            .on_action(cx.listener(Self::remove_selected))
             .size_full()
-            .flex()
-            .flex_col()
+            .relative()
             .bg(rgb(BG))
             .font_family(FONT)
             .text_size(px(13.))
             .text_color(rgb(TEXT))
-            .child(self.render_header(cx))
-            .child(self.render_search(cx))
-            .child(div().h(px(1.)).bg(rgb(BORDER)))
-            .child(body)
             .child(
                 div()
-                    .h(px(32.))
-                    .px(px(16.))
+                    .key_context(CONTEXT)
+                    .on_action(cx.listener(Self::select_prev))
+                    .on_action(cx.listener(Self::select_next))
+                    .on_action(cx.listener(Self::confirm))
+                    .on_action(cx.listener(Self::open_terminal))
+                    .on_action(cx.listener(Self::cancel))
+                    .on_action(cx.listener(Self::add_folder))
+                    .on_action(cx.listener(Self::remove_selected))
+                    .size_full()
                     .flex()
-                    .items_center()
-                    .justify_between()
-                    .border_t_1()
-                    .border_color(rgb(BORDER))
-                    .text_size(px(12.))
-                    .child(div().truncate().text_color(status_color).child(status))
+                    .flex_col()
+                    .child(self.render_header(cx))
+                    .child(self.render_search(cx))
+                    .child(div().h(px(1.)).bg(rgb(BORDER)))
+                    .child(body)
                     .child(
                         div()
+                            .h(px(32.))
+                            .px(px(16.))
                             .flex()
-                            .gap(px(14.))
-                            .text_color(rgb(SUBTLE))
-                            .children(hints.iter().copied()),
+                            .items_center()
+                            .justify_between()
+                            .border_t_1()
+                            .border_color(rgb(BORDER))
+                            .text_size(px(12.))
+                            .child(div().truncate().text_color(status_color).child(status))
+                            .child(
+                                div()
+                                    .flex()
+                                    .gap(px(14.))
+                                    .text_color(rgb(SUBTLE))
+                                    .children(["↑↓ navigate", "↵ open", "Ctrl ↵ terminal", "Ctrl ⌫ remove"]),
+                            ),
                     ),
             )
+            .children(self.add_dialog.as_ref().map(|dialog| self.render_dialog(dialog, cx)))
     }
 }
 
@@ -765,10 +942,12 @@ fn main() {
             KeyBinding::new("up", SelectPrev, Some(CONTEXT)),
             KeyBinding::new("down", SelectNext, Some(CONTEXT)),
             KeyBinding::new("enter", Confirm, Some(CONTEXT)),
+            KeyBinding::new("ctrl-enter", OpenTerminal, Some(CONTEXT)),
             KeyBinding::new("escape", Cancel, Some(CONTEXT)),
-            KeyBinding::new("ctrl-n", OpenFolder, Some(CONTEXT)),
-            KeyBinding::new("ctrl-l", PastePath, Some(CONTEXT)),
+            KeyBinding::new("ctrl-n", AddFolder, Some(CONTEXT)),
             KeyBinding::new("ctrl-backspace", RemoveSelected, Some(CONTEXT)),
+            KeyBinding::new("enter", DialogConfirm, Some(DIALOG_CONTEXT)),
+            KeyBinding::new("escape", DialogCancel, Some(DIALOG_CONTEXT)),
             KeyBinding::new("ctrl-q", Quit, None),
         ]);
         cx.on_action(|_: &Quit, cx| cx.quit());
