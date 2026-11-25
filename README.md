@@ -8,7 +8,7 @@ A small, keyboard-driven desktop app for bookmarking the directories you use oft
 - **Paste-friendly paths.** Accepts absolute paths, `~` and `~/…`, quoted paths, and `file://` URIs (percent-encoded too).
 - **Instant search** across directory names and paths. Every word in the query must match, and names that start with the query rank first.
 - **Recent first.** Results are ordered by when you last opened them, then by when you added them.
-- **Open in your file manager or a terminal.** Each row has Files and Terminal buttons. The terminal starts inside the folder (uses `$TERMINAL`, then gnome-terminal, konsole, kitty, alacritty, wezterm, xterm and others).
+- **Open in your file manager or a terminal.** Each row has Files, Terminal and Copy path buttons. The terminal starts inside the folder (uses `$TERMINAL`, then gnome-terminal, konsole, kitty, alacritty, wezterm, xterm and others).
 - **Stays local.** Everything is stored in a local SQLite database. No accounts, no network.
 
 ## Keyboard shortcuts
@@ -19,6 +19,7 @@ A small, keyboard-driven desktop app for bookmarking the directories you use oft
 | `↑` / `↓`        | Move the selection                              |
 | `Enter`          | Open the selected directory in the file manager |
 | `Ctrl+Enter`     | Open a terminal in the selected directory       |
+| `Ctrl+Shift+C`   | Copy the selected directory's path              |
 | `Esc`            | Clear the search, or close the Add folder dialog |
 | `Ctrl+N`         | Open the Add folder dialog                      |
 | `Ctrl+Backspace` | Remove the selected directory from the list     |
