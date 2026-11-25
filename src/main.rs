@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
 use gpui::{
-    App, Application, Bounds, ClickEvent, Context, Entity, FocusHandle, Focusable, FontWeight,
+    App, Application, Bounds, ClickEvent, ClipboardItem, Context, Entity, FocusHandle, Focusable, FontWeight,
     Hsla, KeyBinding, PathPromptOptions, ScrollStrategy, SharedString, Subscription,
     TitlebarOptions, UniformListScrollHandle, Window, WindowBounds, WindowOptions, actions, div,
     prelude::*, px, rgb, rgba, size, uniform_list,
@@ -32,7 +32,7 @@ const ROW_HEIGHT: f32 = 44.;
 actions!(
     directory_saver,
     [
-        SelectPrev, SelectNext, Confirm, OpenTerminal, Cancel, AddFolder, RemoveSelected,
+        SelectPrev, SelectNext, Confirm, OpenTerminal, CopyPath, Cancel, AddFolder, RemoveSelected,
         DialogConfirm, DialogCancel, Quit,
     ]
 );
@@ -54,12 +54,14 @@ enum OpenWith {
 #[derive(Clone, Copy, PartialEq)]
 enum RowAction {
     Open(OpenWith),
+    CopyPath,
     Remove,
 }
 
-const ROW_ACTIONS: [(RowAction, &str); 3] = [
+const ROW_ACTIONS: [(RowAction, &str); 4] = [
     (RowAction::Open(OpenWith::Terminal), "Terminal"),
     (RowAction::Open(OpenWith::Files), "Files"),
+    (RowAction::CopyPath, "Copy path"),
     (RowAction::Remove, "Remove"),
 ];
 
@@ -201,6 +203,22 @@ impl DirectorySaver {
         if let Some(ix) = self.selected {
             self.open_dir(ix, OpenWith::Terminal, cx);
         }
+    }
+
+    fn copy_selected_path(&mut self, _: &CopyPath, _: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.selected {
+            self.copy_path(ix, cx);
+        }
+    }
+
+    fn copy_path(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(dir) = self.results.get(ix) else {
+            return;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(dir.path.display().to_string()));
+        self.notice = Some(Notice::Info(format!("Copied {}", self.display_path(&dir.path)).into()));
+        self.selected = Some(ix);
+        cx.notify();
     }
 
     fn cancel(&mut self, _: &Cancel, _: &mut Window, cx: &mut Context<Self>) {
@@ -358,6 +376,7 @@ impl DirectorySaver {
     fn run_row_action(&mut self, ix: usize, action: RowAction, cx: &mut Context<Self>) {
         match action {
             RowAction::Open(with) => self.open_dir(ix, with, cx),
+            RowAction::CopyPath => self.copy_path(ix, cx),
             RowAction::Remove => self.remove_at(ix, cx),
         }
     }
@@ -884,6 +903,7 @@ impl Render for DirectorySaver {
                     .on_action(cx.listener(Self::select_next))
                     .on_action(cx.listener(Self::confirm))
                     .on_action(cx.listener(Self::open_terminal))
+                    .on_action(cx.listener(Self::copy_selected_path))
                     .on_action(cx.listener(Self::cancel))
                     .on_action(cx.listener(Self::add_folder))
                     .on_action(cx.listener(Self::remove_selected))
@@ -943,6 +963,7 @@ fn main() {
             KeyBinding::new("down", SelectNext, Some(CONTEXT)),
             KeyBinding::new("enter", Confirm, Some(CONTEXT)),
             KeyBinding::new("ctrl-enter", OpenTerminal, Some(CONTEXT)),
+            KeyBinding::new("ctrl-shift-c", CopyPath, Some(CONTEXT)),
             KeyBinding::new("escape", Cancel, Some(CONTEXT)),
             KeyBinding::new("ctrl-n", AddFolder, Some(CONTEXT)),
             KeyBinding::new("ctrl-backspace", RemoveSelected, Some(CONTEXT)),
